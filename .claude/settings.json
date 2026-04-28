@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.go$\")",
+      "Read(//Users/bytedance/.claude/**)",
+      "Read(//Users/bytedance/jimmie/git/**)",
+      "Read(//Users/bytedance/jimmie/**)",
+      "Bash(grep -n \"^function query\\\\|^async function.*query\\\\|^export function query\\\\|^export const query\\\\|export {.*query\\\\|^\\\\s\\\\+query,\" /Users/bytedance/jimmie/git/claude_agent_sdk_playground/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs)"
+    ]
+  }
+}
