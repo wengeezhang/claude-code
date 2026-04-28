@@ -1,730 +1,1001 @@
-# Claude Code 源码分析
+# Claude Code 源码深度分析
 
-> 基于泄露的 Claude Code CLI 源码镜像（2026 年 3 月通过 npm sourcemap 泄露）。核心代码约 6900 行，整体 50+ 子系统。
+> 本文档基于 `@anthropic-ai/claude-code` npm 包通过 sourcemap 还原出的源码进行分析。
+> 仓库根目录：`/Users/bytedance/jimmie/git/claude-code`
+> 仅用于研究与学习目的，原始代码版权归 Anthropic 所有。
 
----
+## 目录
 
-## 一、整体架构
-
-### 1. 入口与启动（[src/main.tsx:1-150](src/main.tsx#L1-L150)）
-
-[main.tsx](src/main.tsx)（4683 行）是 CLI 单文件入口，用 Commander.js 解析命令，React/Ink 渲染。启动顺序被刻意优化：
-
-- 第 9–20 行：`profileCheckpoint` → `startMdmRawRead` → `startKeychainPrefetch` 必须在其他 import 之前执行，让 macOS `plutil` / keychain 子进程与后续 ~135ms 的模块求值并行。
-- `feature('FLAG')`（Bun 的构建期常量）配合 `require()` 实现**死代码消除**：KAIROS、COORDINATOR_MODE、HISTORY_SNIP、PROACTIVE 等模式在构建时被裁掉。
-- 真正的交互式入口在 [replLauncher.tsx](src/replLauncher.tsx)；headless/SDK 路径在 [entrypoints/sdk](src/entrypoints/sdk)。
-
-### 2. 核心对话循环：QueryEngine + query.ts
-
-这是整个 agent 的心脏。
-
-**[QueryEngine.ts](src/QueryEngine.ts)**（1295 行）—— 面向 SDK 的有状态会话类。一个会话一个 `QueryEngine`，每次 `submitMessage()` 是一轮。它负责：
-
-- 装配系统提示：[QueryEngine.ts:288-308](src/QueryEngine.ts#L288-L308) 调用 `fetchSystemPromptParts()` 拿到 `defaultSystemPrompt / userContext / systemContext`，再按 coordinator 模式 merge。
-- 包装 `canUseTool` 追踪 permission denials（[QueryEngine.ts:243-271](src/QueryEngine.ts#L243-L271)）。
-- 跨轮维护 `mutableMessages / readFileState / totalUsage / discoveredSkillNames`。
-
-**[query.ts](src/query.ts)**（1729 行）—— 真正的 agent loop 生成器。处理自动 compact（[services/compact/autoCompact.ts](src/services/compact/autoCompact.ts)）、reactive compact、context collapse、snip compaction、工具结果预算、fallback 模型重试。消息流是 `AsyncGenerator<SDKMessage>`，REPL 和 SDK 都消费这同一个流。
-
-**[Tool.ts](src/Tool.ts)**（792 行）—— 工具协议。核心是 `ToolUseContext`（[Tool.ts:158-300](src/Tool.ts#L158-L300)），几乎每个子系统都挂在上面：permission context、MCP clients、agent IDs、file history、通知、进度回调、abort signal、content replacement budget……`Tool<Input, Output, Progress>` 是所有工具的通用签名（`call / description / inputSchema / isConcurrencySafe / isReadOnly / interruptBehavior`）。
-
-### 3. 工具层（40+ 工具，全部在 [src/tools/](src/tools/)）
-
-[tools.ts](src/tools.ts) 是注册中枢。典型特征：
-
-- **基础**：Bash、FileRead/Write/Edit、Glob、Grep、WebFetch、WebSearch、NotebookEdit、TodoWrite。
-- **Agent 编排**：[AgentTool](src/tools/AgentTool/AgentTool.tsx)（1397 行）—— 启动 subagent，支持本地/远程、worktree 隔离、auto-background、fork 继承 parent 的 prompt cache（[forkSubagent.ts](src/tools/AgentTool/forkSubagent.ts)）。
-- **Skill**：[SkillTool](src/tools/SkillTool)，动态发现 + 按需加载。
-- **ToolSearch**：把罕用工具标为 "deferred"，只在需要时通过关键字搜索加载 schema——控制 token 预算。
-- **条件工具**（只在特定 feature 下注册）：SleepTool（PROACTIVE/KAIROS）、Cron*（AGENT_TRIGGERS）、RemoteTriggerTool、MonitorTool、PushNotificationTool。
-- **BashTool** ([BashTool.tsx:1-60](src/tools/BashTool/BashTool.tsx#L1-L60)) 特别复杂：AST 解析命令、wildcard 权限匹配、sandbox 判定、后台任务、sed 编辑解析、image 输出、git 操作追踪。
-
-### 4. 周边系统
-
-- **[services/mcp/](src/services/mcp/)** —— MCP 客户端、官方 registry、Claude.ai MCP 配置同步、企业策略过滤、VSCode SDK MCP。
-- **[hooks/](src/hooks/)** —— 70+ React 钩子，驱动 Ink UI（补全、历史、通知、IDE 集成、swarm 协调、远程会话）。
-- **[ink/](src/ink/)** —— 自定义 React 终端 renderer（reconciler、布局、bidi、ANSI 处理、终端查询），替代 stock ink 以支持 FPS tracker、selection、hit-test。
-- **[services/autoDream/](src/services/autoDream/)** —— 后台整理 `MEMORY.md` 的子 agent（config + consolidationLock + consolidationPrompt），对应 "Dream" 系统。
-- **[coordinator/coordinatorMode.ts](src/coordinator/coordinatorMode.ts)** —— Swarm 多 agent 编排（构建时可裁掉）。
-- **[buddy/](src/buddy/)** —— Tamagotchi 彩蛋（Mulberry32 PRNG，18 种物种）。
-- **[assistant/](src/assistant)** —— KAIROS "always-on" 模式；[gate.ts](src/assistant/gate.ts) 控制准入。
-- **[commands/](src/commands/)** —— slash 命令定义（/init、/review、/compact、/fast 等），[commands.ts](src/commands.ts) 做聚合和远程模式过滤。
-- **[entrypoints/sdk](src/entrypoints/sdk)** —— 把 QueryEngine 暴露成 Claude Agent SDK。
-
-### 5. 架构亮点
-
-1. **构建期 feature flag + 条件 require** = 同一份源码，不同形态产物（内部 ant 版、公共版、KAIROS、coordinator），没有运行时开销。
-2. **启动期并行 I/O** — keychain、MDM、GrowthBook、AWS/GCP 凭证、MCP 注册表全部 prefetch。
-3. **Prompt cache 一等公民** — `renderedSystemPrompt` 被冻结并在 fork agent 间共享，避免 GrowthBook 冷热切换导致 cache miss（[Tool.ts:293-299](src/Tool.ts#L293-L299)）。
-4. **Tool result budget** — `contentReplacementState` 跨会话追踪工具输出大小，超标自动替换为 tombstone。
-5. **Message pipeline 分层** — user input → processUserInput → QueryEngine → query loop → Tool.call → UI progress → transcript 持久化，全程 generator。
+1. [核心 Agent Loop 架构](#一核心-agent-loop-架构)
+2. [压缩链路详解](#二压缩链路详解)
+3. [React/Ink 终端应用](#三reactink-终端应用)
+4. [Client SDK vs Agent SDK vs Claude Code CLI](#四client-sdk-vs-agent-sdk-vs-claude-code-cli)
+5. [为什么 npm 包会被称为"源码泄露"](#五为什么-npm-包会被称为源码泄露)
+6. [Streaming 输入模式](#六streaming-输入模式)
+7. [Agent 执行中的用户输入处理](#七agent-执行中的用户输入处理)
+8. [LSP 工具](#八lsp-工具)
+9. [Prompt Cache 机制](#九prompt-cache-机制)
 
 ---
 
-## 二、从 `claude` 命令行到输出结果的完整流程
+## 一、核心 Agent Loop 架构
 
-下面按**时间线**串起来讲，每个阶段给出关键文件与行号。
+### 心智地图
 
-### 阶段 0：Bun/Node 进入 [main.tsx](src/main.tsx)（副作用优先）
-
-CLI 打包进单个 JS 文件，Node/Bun 开始执行 [main.tsx:1-20](src/main.tsx#L1-L20) 的三条 **top-level side effect**（顺序极重要，都在 import 完成之前触发）：
-
-1. `profileCheckpoint('main_tsx_entry')` — 启动打点。
-2. `startMdmRawRead()` — fork `plutil` / `reg query` 子进程读 MDM 配置。
-3. `startKeychainPrefetch()` — **并行**读 macOS Keychain 的 OAuth token 和 legacy API key。
-
-用意：让这些 I/O 和后续 ~135 ms 的 import 求值重叠。剩下的 import 进来时，子进程结果已就绪。
-
-### 阶段 1：Commander 解析命令行
-
-[main.tsx:902](src/main.tsx#L902) 创建 `new CommanderCommand()`，注册几十个子命令（`mcp`、`auth`、`plugin`、`doctor`、`update`、`install`、`assistant`、`agents`、`task` …）。不带子命令时走**默认 action**——也就是 REPL。
-
-默认 action 里依次：
-- 跑 `runMigrations()` ([main.tsx:326](src/main.tsx#L326)) — 版本迁移，例如把 `sonnet-4.5` 迁到 `sonnet-4.6`。
-- `init()` ([entrypoints/init.ts](src/entrypoints/init.ts)) — 读取分层 settings、MDM、plugin、skill、apply env、初始化 analytics。
-- 并行 prefetch：`fetchBootstrapData`、`prefetchOfficialMcpUrls`、`prefetchPassesEligibility`、`prefetchAwsCredentialsAndBedRockInfoIfSafe`、`loadPolicyLimits`、`initializeGrowthBook`。
-- `showSetupScreens()` — 首次登录、trust dialog、onboarding（[interactiveHelpers.tsx](src/interactiveHelpers.tsx)）。
-- 解析 `--continue` / `--resume` / `--print` / `connect` / `ssh` / `assistant` 分支。普通情况走 `launchRepl(...)`（[main.tsx:3134](src/main.tsx#L3134)）。
-
-### 阶段 2：拉起 React/Ink UI —— `launchRepl`
-
-[replLauncher.tsx:12-22](src/replLauncher.tsx#L12-L22) 是个极小的薄包装，**懒加载** `App` 和 `REPL`（避免首屏引入 ink 模块）：
-
-```ts
-const { App }  = await import('./components/App.js')
-const { REPL } = await import('./screens/REPL.js')
-await renderAndRun(root, <App {...appProps}><REPL {...replProps}/></App>)
+```
+                       ┌──────────────────────────────────────┐
+                       │         QueryEngine.submitMessage()    │  AsyncGenerator<SDKMessage>
+                       │  ── wrap canUseTool                    │
+                       │  ── fetchSystemPromptParts             │
+                       │  ── processUserInput                   │
+                       │  ── persist transcript                 │
+                       │  ── yield system_init                  │
+                       │  ── for await ... of query({...})      │
+                       │  ── track usage / denials / budget     │
+                       └──────────────────────────────────────┘
+                                       ↓
+                       ┌──────────────────────────────────────┐
+                       │            queryLoop (while true)      │
+                       │     6 stages per turn:                 │
+                       │  ① compression pipeline                │
+                       │  ② callModel streaming                 │
+                       │  ③ error recovery (413/media/OTK)      │
+                       │  ④ stopHooks                           │
+                       │  ⑤ tool execution (runTools)           │
+                       │  ⑥ attachments + next turn             │
+                       └──────────────────────────────────────┘
+                                       ↓
+                       ┌──────────────────────────────────────┐
+                       │           runTools / runToolUse        │
+                       │  ── partitionToolCalls (并发批 vs 串行批) │
+                       │  ── canUseTool gate (7-step)           │
+                       │  ── tool.call() → tool_result          │
+                       └──────────────────────────────────────┘
 ```
 
-- `App` ([components/App.tsx](src/components/App.tsx)) —— 55 行，是 store provider + FPS tracker + 全局 context wrapper。
-- `REPL` ([screens/REPL.tsx](src/screens/REPL.tsx)) —— **5005 行**，整个终端 UI 与对话生命周期的指挥中心。
-- `renderAndRun` 使用 [src/ink/](src/ink/) 里自研的 React → 终端 reconciler（不是 stock ink）。
+### QueryEngine（顶层编排者）
 
-REPL 挂载完成后显示 `>` 提示符，光标等待输入；同时后台还在：
-- 连 MCP server（`useManageMCPConnections`）。
-- 订阅 FS watchers 监听 settings / skills 变更。
-- 初始化 LSP manager（[services/lsp/manager.ts](src/services/lsp/manager.ts)）。
-- Kairos/proactive 后台 agent（若启用）。
+`/src/QueryEngine.ts` 中的 `QueryEngine` 类，核心方法 `submitMessage()` 是一个 `AsyncGenerator<SDKMessage>`。每调用一次相当于把"一条用户消息"喂进系统并消费回所有产生的事件流。
 
-### 阶段 3：用户按下回车 —— `onSubmit`
+关键流程：
+1. **包装 canUseTool**：把外部传入的权限回调包成统一接口
+2. **fetchSystemPromptParts**：拉取 system prompt 各组成部分（Claude Code 主提示词、CLAUDE.md 内容、用户上下文）
+3. **processUserInput**：消化用户输入，处理斜杠命令和 bash 命令前缀
+4. **持久化 transcript**：写入会话日志 jsonl
+5. **yield system_init**：发出第一条系统初始化事件
+6. **for await of query()**：进入主循环消费消息流
+7. **追踪 usage、denials、budget**：累积本次 session 的 token 用量与权限拒绝事件
 
-用户输入 "帮我改个 bug"，回车后触发 [REPL.tsx:3142](src/screens/REPL.tsx#L3142) 的 `onSubmit`：
+### queryLoop 的 6 阶段
 
-1. **滚动重置** `repinScroll()`，恢复 proactive loop。
-2. **斜杠命令快路径** ([REPL.tsx:3161-3282](src/screens/REPL.tsx#L3161-L3282))：若 `input` 以 `/` 开头、命中 `immediate: true` 或来自 keybinding（如 `/compact`、`/clear`、`/help`），直接 `matchingCommand.load()` + 执行 local-jsx，**绕过 agent**，return。
-3. **idle-return 检查**：空闲 > 75 min 且 token > 100k，弹 "要不要新开对话？" 对话框。
-4. **加入 history**（上下方向键回放）。
-5. **入队 or 立即执行**：若 Claude 正忙 → 插入 `messageQueueManager`（[utils/messageQueueManager.ts](src/utils/messageQueueManager.ts)），待当前 turn 完成再 drain；否则走 `handlePromptSubmit` → `executeUserInput`。
+`/src/query.ts` 的 `queryLoop()` 是一个 `while(true)` 循环，每一轮 = 一次 LLM 请求 + 一批工具执行。State 类型包含：
 
-### 阶段 4：消息规范化 —— `processUserInput`
-
-[utils/processUserInput/processUserInput.ts:85](src/utils/processUserInput/processUserInput.ts#L85) 负责把原始字符串变成 agent 能吃的 `Message[]`：
-
-- 展开 `[Pasted text #N]` 占位符成真实文本。
-- 解析 `@file` mention、IDE selection、粘贴的图片。
-- 若是 `!cmd`（bash mode）→ 就地 `exec` 并把 stdout 包进 `<local-command-stdout>`。
-- 若是 `/slashcmd`（非 immediate）→ 查命令 registry（[commands.ts](src/commands.ts)），按类型走：
-  - `local` —— JS 函数直接跑。
-  - `prompt` —— 展开成 prompt 附到 user message 前。
-  - `local-jsx` —— 挂 React 组件。
-- 组装 attachments（CLAUDE.md、nested memory、queued notifications）。
-- 触发 `UserPromptSubmit` hooks（[utils/sessionStart.ts](src/utils/sessionStart.ts) 家族）——hook 可以 block 提交、改写 prompt、注入 context。
-- 返回 `{ messages, shouldQuery, additionalAllowedTools, ... }`。
-
-`executeUserInput` 然后拿这个结果调用 `onQuery`。
-
-### 阶段 5：组装上下文 —— `onQueryImpl`
-
-[REPL.tsx:2661-2803](src/screens/REPL.tsx#L2661-L2803) 在真正发请求前做六件事：
-
-1. `diagnosticTracker.handleQueryStart` + 关闭 IDE 里之前打开的 diff。
-2. `generateSessionTitle` — 首轮用 Haiku 起个会话标题（[REPL.tsx:2684-2699](src/screens/REPL.tsx#L2684-L2699)）。
-3. 应用 skill 作用域的 `allowedTools`。
-4. `getToolUseContext(...)` — 构建整个 `ToolUseContext`（[Tool.ts:158-300](src/Tool.ts#L158-L300)）：tools、commands、MCP clients、agent definitions、permission context、file state cache、abort controller……
-5. **并行**拉取 ([REPL.tsx:2768-2772](src/screens/REPL.tsx#L2768-L2772))：
-   - `checkAndDisableBypassPermissionsIfNeeded`
-   - `getSystemPrompt(tools, model, cwd, mcpClients)` — 组装包含工具清单、CLAUDE.md、平台信息、当前日期的系统提示。
-   - `getUserContext()` / `getSystemContext()` — 用户元数据和环境快照。
-6. `buildEffectiveSystemPrompt()` 叠加 `customSystemPrompt` / agent definition，**冻结** `toolUseContext.renderedSystemPrompt`（[Tool.ts:293-299](src/Tool.ts#L293-L299)）—— 用于子 agent 共享同一 prompt cache。
-
-然后：
-
-```ts
-for await (const event of query({
-  messages, systemPrompt, userContext, systemContext,
-  canUseTool, toolUseContext, querySource: 'repl_main_thread'
-})) {
-  onQueryEvent(event)
+```typescript
+type State = {
+  messages: Message[]
+  toolUseContext: ToolUseContext
+  autoCompactTracking: { consecutiveFailures: number, ... }
+  maxOutputTokensRecoveryCount: number
+  hasAttemptedReactiveCompact: boolean
+  transition: 'continue' | 'done'
 }
 ```
 
-### 阶段 6：Agent 核心循环 —— [query.ts:219](src/query.ts#L219)
+每一轮执行的 6 个阶段：
 
-`query()` 是 `AsyncGenerator`，里面套 `queryLoop`（[query.ts:241](src/query.ts#L241)），循环体每一"轮"的步骤：
+**Stage 1 — 压缩流水线**：依次跑 `applyToolResultBudget` → `snipCompact`（feature gated）→ `microcompact` → `contextCollapse`（feature gated）→ `autoCompactIfNeeded` → 阻塞限制检查。详见第二章。
 
-#### 6.1 每轮预处理（[query.ts:307-549](src/query.ts#L307-L549)）
+**Stage 2 — callModel streaming**：通过 `queryModelWithStreaming()`（`/src/services/api/claude.ts`）发起 SSE 流式请求，逐 chunk 拼接 assistant 消息。
 
-- `startRelevantMemoryPrefetch` / `startSkillDiscoveryPrefetch` —— 用 `using` 语法与模型流并发启动。
-- `yield { type: 'stream_request_start' }` —— UI 把 spinner 拉起来。
-- `applyToolResultBudget` —— 超额的旧 tool result 换成 tombstone（token budget）。
-- HISTORY_SNIP 裁旧消息、microcompact 做分块压缩、CONTEXT_COLLAPSE 折叠历史、autocompact 若超阈值整段压缩成摘要（[query.ts:400-543](src/query.ts#L400-L543)）。
-- 选择模型：`getRuntimeMainLoopModel({ permissionMode, mainLoopModel, exceeds200kTokens })`。
+**Stage 3 — 错误恢复**：处理 fallback、413（prompt_too_long）、media_size_error、max_output_tokens 这几类可恢复错误。典型模式是"withhold-then-recover"——先把超量内容暂时移除、重发请求，成功后再补回。
 
-#### 6.2 调用 Claude API（[query.ts:659-863](src/query.ts#L659-L863)）
+**Stage 4 — stopHooks**：执行用户配置的 hook，可能改变控制流。
 
-```ts
-for await (const message of deps.callModel({
-  messages: prependUserContext(messagesForQuery, userContext),
-  systemPrompt: fullSystemPrompt,
-  thinkingConfig,
-  tools,
-  signal,
-  options: { model, toolChoice, fallbackModel, mcpTools, ... }
-}))
+**Stage 5 — tool execution**：调 `runTools()`（详见下文）。
+
+**Stage 6 — attachments + next turn**：把 tool_result 拼回 messages 数组，准备下一轮输入。
+
+### Tool 抽象
+
+`/src/Tool.ts` 定义了 `Tool<Input, Output, P>` 接口，约 40 个字段，覆盖：
+- 元信息：name、description、inputSchema、outputSchema
+- 行为标记：isReadOnly、isConcurrencySafe、isDestructive、isEnabled
+- 权限：checkPermissions、requiresUserInteraction
+- 执行：call、validateInput、isValidForRender
+- UI：renderToolUseMessage、renderResultForAssistant
+
+`buildTool()` 工厂结合 `TOOL_DEFAULTS`（默认值：isEnabled=true、isConcurrencySafe=false、isReadOnly=false、isDestructive=false、checkPermissions=allow）让每个工具只声明自己关心的字段。
+
+### runTools 的并发调度
+
+`/src/services/tools/toolOrchestration.ts` 的 `runTools()` 把 `tool_use` 块列表按并发安全性分批：
+
+```typescript
+function partitionToolCalls(toolUseMessages, ctx): Batch[]
+// 连续的 isConcurrencySafe 工具被打包到一起 → runToolsConcurrently
+// 不安全的工具单独成批 → runToolsSerially
 ```
 
-`deps.callModel` = [queryModelWithStreaming](src/services/api/claude.ts#L752) → `queryModel` → `@anthropic-ai/sdk` 的 `/v1/messages?stream=true`。返回的是 `AssistantMessage` / `StreamEvent` / `SystemAPIErrorMessage` 混合流。收到的每条 `assistant` 消息：
+并发上限默认 10，可通过 `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` 环境变量调整。这是为什么并行用 Read/Grep/Glob 速度飞快（属于 isConcurrencySafe），而 Edit/Write/Bash 必须串行（会改变世界状态）。
 
-- `yield` 给上层 UI 即时显示（流式渲染）。
-- 若包含 `tool_use` block → 存进 `toolUseBlocks`，`needsFollowUp = true`。
-- 若 `StreamingToolExecutor` 开启，tool_use 一出现就开始**推测执行**（与模型继续输出并行）——[query.ts:841-844](src/query.ts#L841-L844)。
-- `FallbackTriggeredError` → 切到 fallback 模型重试整轮（[query.ts:894-951](src/query.ts#L894-L951)）。
+### 7 步权限 Gate
 
-#### 6.3 执行工具 —— [services/tools/toolOrchestration.ts:19](src/services/tools/toolOrchestration.ts#L19) 的 `runTools`
+`/src/utils/permissions/permissions.ts` 的 `hasPermissionsToUseToolInner()` 按顺序检查：
 
-```ts
-const toolUpdates = streamingToolExecutor
-  ? streamingToolExecutor.getRemainingResults()
-  : runTools(toolUseBlocks, assistantMessages, canUseTool, toolUseContext)
+1. **1a — 全局 deny 规则**：用户配置的 `permissions.deny` 直接拒
+2. **1b — 全局 ask 规则**：`permissions.ask` 强制询问用户
+3. **1c — tool.checkPermissions**：工具自带的权限逻辑
+4. **1d — 工具自定义 deny**：返回 deny 直接拒
+5. **1e — requiresUserInteraction**：需要用户介入的强制询问
+6. **1f — 内容特定 ask**：基于工具输入内容的细粒度询问（如 Bash 命令前缀）
+7. **1g — safety check**：分类器判定是否危险
+
+这 7 步组合让"自动允许已知安全操作 + 询问可能危险操作 + 拒绝明显有害操作"成为可能。
+
+### ToolUseContext
+
+横贯整个调用链的状态聚合器，包含：
+- options（工具池、模型、配置）
+- abortController（用于 ESC 中止）
+- agentId、querySource（区分主线 vs subagent）
+- readFileState（已读文件追踪）
+- appState（应用全局状态）
+- setInProgressToolUseIDs（追踪正在执行的工具）
+
+### 测试性与依赖注入
+
+`/src/query/deps.ts` 把可替换依赖收口到 `QueryDeps`：
+
+```typescript
+type QueryDeps = {
+  callModel: ...,
+  microcompact: ...,
+  autocompact: ...,
+  uuid: () => string,
+}
 ```
 
-`runTools` 做的事：
-- `partitionToolCalls` —— 连续的 **concurrency-safe**（= read-only）工具合并成一 batch 并发跑；写操作单独串行（[toolOrchestration.ts:91-115](src/services/tools/toolOrchestration.ts#L91-L115)）。
-- 每个 tool 进入 [toolExecution.ts:337 `runToolUse`](src/services/tools/toolExecution.ts#L337)，它：
-  1. `findToolByName` —— 在 available + legacy alias 里找。
-  2. `tool.inputSchema.safeParse(input)` —— **Zod 校验**（模型经常传错字段），失败返回 `InputValidationError` 附 schema hint。
-  3. `tool.validateInput?()` —— 工具自定义校验。
-  4. `checkPermissionsAndCallTool` ([toolExecution.ts:599](src/services/tools/toolExecution.ts#L599))：
-     - BashTool 提前启动 classifier speculation。
-     - 跑 **PreToolUse hooks**。
-     - `canUseTool()` ([hooks/useCanUseTool.tsx](src/hooks/useCanUseTool.tsx))：按 permission mode (`default` / `plan` / `acceptEdits` / `bypassPermissions`) 检查 `alwaysAllow/Deny/Ask` 规则，必要时弹确认对话框。
-     - 通过后 `await tool.call(callInput, ctx, canUseTool, parentMessage, onProgress)` ([toolExecution.ts:1207](src/services/tools/toolExecution.ts#L1207))。
-     - 跑 **PostToolUse hooks**。
-  5. 包装成 `tool_result` block 的 `UserMessage`，`yield` 出去。
-
-#### 6.4 把工具结果拼回去，进入下一轮
-
-`toolResults` 被 `normalizeMessagesForAPI` 过滤后 push 到 `messages`；循环回 6.1，带着新的历史再发一次 API 请求——直到模型返回**没有 tool_use 的 assistant 消息**（`needsFollowUp = false`）。
-
-#### 6.5 终止检查（[query.ts:1062-1376](src/query.ts#L1062-L1376)）
-
-- `executePostSamplingHooks` —— 采样后 hook。
-- **prompt-too-long 恢复**：collapse-drain → reactive compact → 真失败才 surface（[query.ts:1100-1183](src/query.ts#L1100-L1183)）。
-- **max_output_tokens 恢复**：先升到 64k 重试，再发 "继续" 用户消息多轮续写（[query.ts:1188-1256](src/query.ts#L1188-L1256)）。
-- `handleStopHooks` —— Stop hook 可以 block 终止、注入错误让模型再说一轮（[query.ts:1267-1306](src/query.ts#L1267-L1306)）。
-- TOKEN_BUDGET 超限时决定 `continue` / 结束（[query.ts:1308-1376](src/query.ts#L1308-L1376)）。
-
-模型产出最终纯文本响应且所有 hook 放行 → generator 返回 `{ reason: 'completed' }`。
-
-### 阶段 7：UI 消费流 —— `onQueryEvent`
-
-[REPL.tsx:2584](src/screens/REPL.tsx#L2584) 的 `onQueryEvent` 把 generator 吐出来的 event 转成 React state：
-
-- `stream_request_start` → spinner on。
-- `assistant` message 增量 → 追加到 `messages[]`，[components/Messages.tsx](src/components/Messages.tsx) 渲染。
-- `tool_use` → [components/ToolUse.tsx](src/components/ToolUse.tsx) 显示工具名/参数预览。
-- `tool_result` → 可能用专属 renderer（`BashToolResultMessage`、`FileEditToolDiff` 等）。
-- `tombstone` → 移除指定 message（fallback / budget 失效）。
-
-每条都写入 transcript（`recordTranscript`，[utils/sessionStorage.ts](src/utils/sessionStorage.ts)）——用于 `--continue`、`/resume`、teleport。
-
-### 阶段 8：回合结束
-
-[REPL.tsx:2810-2853](src/screens/REPL.tsx#L2810-L2853)：
-
-- `fireCompanionObserver` —— BUDDY 彩蛋更新宠物反应。
-- Ant-only：统计 TTFT / OTPS / hook / tool 耗时并写入 `ApiMetricsMessage`。
-- `resetLoadingState()` —— spinner off，abort controller 清空。
-- `onTurnComplete(messages)` —— 触发 `Stop` hook、`flushSessionStorage`、通知 mobile 端。
-- 从 queue 里 drain 下一条用户消息（若上一轮被打断又排队了新输入）。
-- 光标回到 prompt —— **一个 turn 结束**。
+测试里可以用 mock 替换这些，让 queryLoop 的逻辑能在不调真实 API、不真做压缩的情况下被驱动。
 
 ---
 
-## 三、关键对象的生命周期
+## 二、压缩链路详解
 
-| 对象 | 创建点 | 作用域 | 关键用途 |
-|---|---|---|---|
-| `QueryEngine` | SDK/headless：一个会话一个 | 会话级 | 跨 turn 存消息、usage、denials |
-| `ToolUseContext` | `getToolUseContext` 每轮重建 | 一轮 | 工具运行所需一切——权限、MCP、abort、file cache |
-| `AbortController` | 每次提交一个 | 一轮 | Ctrl+C / 新消息打断 |
-| `FileStateCache` | REPL 挂载时一个 | 会话级 | 校验 Edit/Write 前后文件未被外部改 |
-| `renderedSystemPrompt` | `onQueryImpl` 冻结 | 一轮 + fork 子 agent | 保 prompt cache |
-| `mutableMessages` | `QueryEngine` / REPL `messages` state | 会话级 | 构造 API 请求 + 渲染 |
-
----
-
-## 四、时序图
+### 总览
 
 ```
- user types "fix bug" ↵
-        │
-        ▼
- REPL.onSubmit ───────────────────────── immediate slash? ──► run local cmd, done
-        │
-        ▼  (enqueue if busy)
- executeUserInput
-        │
-        ▼
- processUserInput ── hooks.UserPromptSubmit ─► Message[]
-        │
-        ▼
- onQueryImpl: assemble systemPrompt/userContext/ToolUseContext
-        │
-        ▼
- query() async generator ──────────────────┐
-   └─ queryLoop (while true):              │ yields events
-        │                                  ▼
-        ├─ autocompact / snip / collapse   UI streams messages
-        ├─ deps.callModel (Claude /v1/messages?stream=true)
-        │   └─ for each streamed block ── yield
-        ├─ runTools
-        │   └─ runToolUse
-        │       ├─ Zod validate
-        │       ├─ PreToolUse hooks
-        │       ├─ canUseTool (permission)
-        │       ├─ tool.call(...)   ◄── actual side effect
-        │       └─ PostToolUse hooks
-        ├─ append tool_results to history
-        └─ no tool_use in last assistant msg?  ─► break
-        │
-        ▼
- handleStopHooks → token budget check → return
-        │
-        ▼
- onQueryImpl tail: metrics, resetLoadingState, onTurnComplete
-        │
-        ▼
- prompt idle, transcript flushed, ready for next turn
+                    ┌───────────────── queryLoop / 每一轮开头 ─────────────────┐
+                    │                                                          │
+  上一轮工具输出 → ① applyToolResultBudget    (就地裁剪超大 tool_result)
+                    ↓
+                   ② snipCompact              (feature('HISTORY_SNIP'))
+                    ↓
+                   ③ microCompact             (time-based / cached-MC)
+                    ↓
+                   ④ contextCollapse          (feature('CONTEXT_COLLAPSE'))
+                    ↓
+                   ⑤ autoCompactIfNeeded ──┬── trySessionMemoryCompaction
+                    │                       └── compactConversation
+                    ↓
+                   ⑥ blocking-limit check     (PROMPT_TOO_LONG_ERROR_MESSAGE)
+
+       旁路：reactive-compact （on 413 / media）
+       旁路：apiMicrocompact  （服务端 context_edits）
+       收尾：runPostCompactCleanup
 ```
 
----
+设计原则：**渐进地放弃信息**。从只改 tool_result 的内容，到按组丢消息，再到彻底总结重建，越靠后的手段代价越高、对 prompt cache 命中越不友好。
 
-## 五、上下文压缩机制详解
+### 1. applyToolResultBudget
 
-Claude Code 并不是"写满了就截断"那么简单——它把压缩拆成了**六个独立的层**，从轻到重分级处理 context 膨胀。每一层都是 `query()` 循环在每轮开头依次跑的（见 [query.ts:369-543](src/query.ts#L369-L543)）。
+第 379 行附近，每轮开头。遍历上一轮工具产出的 `tool_result`，按每个工具声明的 `maxResultSizeChars` 做尾部截断，插入 `[truncated …]` 占位。不调 LLM，对 prompt cache 前缀几乎无害。
 
-### 1. 阈值与预算（[autoCompact.ts:28-144](src/services/compact/autoCompact.ts#L28-L144)）
+### 2. snipCompact
 
-所有判断的锚点：
+被 `feature('HISTORY_SNIP')` 门控。返回 `{ messages, boundaryMessage, snipTokensFreed }`。基于 `groupMessagesByApiRound` 整组丢弃，避免悬空的 tool_use/tool_result。`snipTokensFreed` 沿 queryLoop 生命期传递，用于后续 blocking-limit 判定时的扣减。
+
+### 3. microCompact（双路）
+
+`/src/services/compact/microCompact.ts`。入口：
+
+```typescript
+microcompactMessages(messages, toolUseContext?, querySource?): Promise<{messages}>
+```
+
+可清白名单：FILE_READ、SHELL_*、GREP、GLOB、WEB_SEARCH、WEB_FETCH、FILE_EDIT、FILE_WRITE。
+
+**time-based 路径**：`evaluateTimeBasedTrigger()` 检测用户最后发言到现在的间隔，超过 `gapThresholdMinutes` 触发。`maybeTimeBasedMicrocompact()` 把旧 tool_result content 改写成占位符，保留最近 `keepRecent` 组（下限 1）。会调 `notifyCacheDeletion()` 失效 cache。
+
+**cached-microcompact 路径**（ant-only，`feature('CACHED_MICROCOMPACT')`）：用 API `cache_edits` 块在服务端原地删除 tool_result，**不破坏前缀缓存**。客户端维护 `mod.registerToolResult/registerToolMessage` 注册表。日志事件 `tengu_cached_microcompact`。
+
+常量：`IMAGE_MAX_TOKEN_SIZE = 2000`，token 估算膨胀系数 `4/3`。
+
+### 4. contextCollapse
+
+`feature('CONTEXT_COLLAPSE')` 门控。基于 projection 的折叠应用，无显式 boundary message——折叠是隐式记忆。
+
+### 5. autoCompactIfNeeded
+
+`/src/services/compact/autoCompact.ts`，常量：
 
 | 常量 | 值 | 含义 |
 |---|---|---|
-| `MAX_OUTPUT_TOKENS_FOR_SUMMARY` | 20,000 | 为压缩的输出保留的 token（p99.99 ≈ 17,387） |
-| `AUTOCOMPACT_BUFFER_TOKENS` | 13,000 | effective window 再留 13k 给模型回答 |
-| `WARNING_THRESHOLD_BUFFER_TOKENS` | 20,000 | 离 autocompact 还有 20k 时 UI 变黄 |
-| `MANUAL_COMPACT_BUFFER_TOKENS` | 3,000 | 硬阻塞线（手动 `/compact` 的底线） |
-| `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` | 3 | 熔断器：连续失败 3 次就放弃 |
+| `MAX_OUTPUT_TOKENS_FOR_SUMMARY` | 20_000 | 给摘要产出留的输出 token |
+| `AUTOCOMPACT_BUFFER_TOKENS` | 13_000 | 阈值缓冲 |
+| `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES` | 3 | 熔断器 |
 
-`effectiveWindow = modelContextWindow - 20000`（给 summary 输出预留），`autocompactThreshold = effectiveWindow - 13000`。200k 的 Sonnet → ≈167k 触发 autocompact。
+`getEffectiveContextWindowSize(model)` = `contextWindow - reservedForSummary`
+`getAutoCompactThreshold(model)` = `effectiveWindow - AUTOCOMPACT_BUFFER_TOKENS`
+（可通过 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 环境变量覆盖）
 
-### 2. 六层压缩栈（按 query.ts 调用顺序）
-
+`calculateTokenWarningState()` 返回五维状态：
 ```
-每轮循环开头:
-  ① applyToolResultBudget   ── 工具结果预算（字节级替换）
-  ② HISTORY_SNIP            ── 按字节裁旧消息
-  ③ microcompact            ── 清旧 tool_result 内容
-  ④ CONTEXT_COLLAPSE        ── 折叠 N 轮对话为摘要
-  ⑤ autocompact             ── 整段历史 → 一段 summary
-       └ trySessionMemoryCompaction (实验性优先)
-  ⑥ reactiveCompact         ── 兜底：API 返回 413 才触发
+{percentLeft, isAboveWarningThreshold, isAboveErrorThreshold, 
+ isAboveAutoCompactThreshold, isAtBlockingLimit}
 ```
 
-#### ① Tool result budget —— [toolResultStorage.ts:924](src/utils/toolResultStorage.ts#L924) `applyToolResultBudget`
+`shouldAutoCompact()` 三条递归护栏：
+- `querySource ∈ {compact, session_memory, marble_origami}` 直接返回 false
+- `feature('REACTIVE_COMPACT')` 开启时让位
+- `feature('CONTEXT_COLLAPSE')` 开启时让位
 
-**最轻**，每轮都跑。作用：**单条 user message 的聚合 tool_result 字节数超限**时，把部分 tool_result 的 `content` 替换成 `[大结果已持久化到 $path，用 Read 读取]` 指针。
+调度顺序：先查熔断 → `shouldAutoCompact` 判定 → 先试 `trySessionMemoryCompaction()` 捷径 → 失败回落到 `compactConversation()` → 更新 `consecutiveFailures`。
 
-- 决策被 `ContentReplacementState` **冻结**：某条 tool_use_id 一旦被替换，以后每次重放都用同一字符串（[toolResultStorage.ts:402](src/utils/toolResultStorage.ts#L402)）——保 prompt cache 一致。
-- `Read` 工具的结果标记 `maxResultSizeChars: Infinity`，永不被替换（模型自己有 `maxTokens` 限制）。
-- 被替换的原文落盘到 `.claude/tool-results/`，模型可以用 `Read` 随时拿回。
+### 6. compactConversation 完整流程
 
-#### ② HISTORY_SNIP —— 按字节裁（feature-gated，ant-only）
+`/src/services/compact/compact.ts`，约 1700 行，主函数横跨几百行。常量：
 
-在 [query.ts:400-410](src/query.ts#L400-L410) 调用。纯机械裁最老的若干条消息，返回 `snipTokensFreed`——这个数字会被 autocompact 当作已释放的 token 纳入判断（否则 autocompact 还按旧 usage 判，会在 snip 刚好够用时多做一次无谓 compact）。
+| 常量 | 值 |
+|---|---|
+| `POST_COMPACT_TOKEN_BUDGET` | 50_000 |
+| `POST_COMPACT_MAX_FILES_TO_RESTORE` | 5 |
+| `POST_COMPACT_MAX_TOKENS_PER_FILE` | 5_000 |
+| `POST_COMPACT_MAX_TOKENS_PER_SKILL` | 5_000 |
+| `POST_COMPACT_SKILLS_TOKEN_BUDGET` | 25_000 |
+| `MAX_COMPACT_STREAMING_RETRIES` | 2 |
+| `MAX_PTL_RETRIES` | 3 |
 
-#### ③ microcompact —— [microCompact.ts:253](src/services/compact/microCompact.ts#L253) `microcompactMessages`
-
-**增量清旧 tool_result 的内容，不动消息结构。** 两个触发条件二选一：
-
-**a. Time-based**（[microCompact.ts:446-530](src/services/compact/microCompact.ts#L446-L530)）
-
-```ts
-gapMinutes = (now - lastAssistantMessageTimestamp) / 60_000
-if (gapMinutes >= config.gapThresholdMinutes) {
-  // 只保留最近 N 条 tool_result，其余的 content 替换为
-  // '[Old tool result content cleared]'
-}
-```
-
-用意：**空闲太久 → 服务器 prompt cache 必然已过期**，反正要整体重算，那就干脆先把老的 tool 结果清掉、减小重算体量。只清白名单里的 7 种工具结果：`FileRead / Bash / Grep / Glob / WebSearch / WebFetch / FileEdit / FileWrite`（[microCompact.ts:41-50](src/services/compact/microCompact.ts#L41-L50)）。
-
-**b. Cached microcompact**（CACHED_MICROCOMPACT gate）
-
-更高级：**不改本地消息**，而是往 API 请求里加一个 `cache_edits` block，告诉服务器"这几个 tool_use_id 从你的缓存前缀里删掉"——本地仍有完整历史，但服务器缓存和实际发送的内容已瘦身。
-
-关键逻辑在 [microCompact.ts:305-399](src/services/compact/microCompact.ts#L305-L399)：
-- `registerToolResult` 按 user message 把 tool_use_id 入账。
-- 超阈值时 `createCacheEditsBlock`，缓存到 `pendingCacheEdits`。
-- API 层插入 `cache_edits`；响应里带回 `cache_deleted_input_tokens`，算出真实省下的 token 后 **延迟 yield 一条 boundary 系统消息**（[query.ts:870-891](src/query.ts#L870-L891)）。
-
-#### ④ CONTEXT_COLLAPSE —— 分段折叠（feature-gated）
-
-在 [query.ts:440-447](src/query.ts#L440-L447) 调用，比 autocompact 更细粒度：把 **中间的若干轮对话** 折叠成一段摘要，保留头尾，而不是像 autocompact 那样整段压成一个 summary。
-
-重点：
-- 结果不写入 REPL 消息数组，而是存在 collapse store 里，每次 `projectView()` **读时投影**。
-- 这样跨 turn 持久化就等于重放 commit log，UI 仍能看到完整滚屏，但 API 只看到折叠视图。
-- 跑在 autocompact 之前——**如果 collapse 就能把上下文压到阈值下，autocompact 自然 no-op**，保留更多原始细节。
-
-#### ⑤ autocompact —— 核心的"大压缩"
-
-入口 [autoCompact.ts:241 `autoCompactIfNeeded`](src/services/compact/autoCompact.ts#L241)。流程：
-
-1. `shouldAutoCompact()` 判断 `tokenCount - snipTokensFreed >= autocompactThreshold`。
-2. **先试 session memory 压缩** ([autoCompact.ts:288-310](src/services/compact/autoCompact.ts#L288-L310))——把早期消息拿去跑一个 ctx-agent 提炼成结构化的 session memory；实验性路径，成功就避开 full compact。
-3. 否则走 [compact.ts:387 `compactConversation`](src/services/compact/compact.ts#L387)：
-   a. 触发 `PreCompact` hooks（可注入 custom instructions）。
-   b. 用 [compact/prompt.ts `BASE_COMPACT_PROMPT`](src/services/compact/prompt.ts#L61) 作为 user message，fork 一个 subagent 让**模型自己给对话写摘要**，要求 9 段结构化输出（Primary Request / Technical Concepts / Files / Errors / Problem Solving / All User Messages / Pending Tasks / Current Work / Next Step）。
-   c. 摘要 request 本身若 413，按 API-round 分组裁掉最老的组重试（最多 `MAX_PTL_RETRIES`，[compact.ts:462-491](src/services/compact/compact.ts#L462-L491)）。
-   d. 成功后**清空 `readFileState` 缓存**，并用 `createPostCompactFileAttachments` 重新 attach 最多 N 个最近访问的文件——保证压缩后模型还能 "看到" 当前的关键文件状态。
-   e. 组装 `CompactionResult`（[compact.ts:330](src/services/compact/compact.ts#L330) `buildPostCompactMessages`）：
-      ```
-      [boundaryMarker, ...summaryMessages, ...messagesToKeep, ...attachments, ...hookResults]
-      ```
-   f. 触发 `SessionStart` hook（type=`'compact'`）。
-4. 熔断器：连续 3 次失败后这个会话彻底不再尝试 autocompact（[autoCompact.ts:67-70](src/services/compact/autoCompact.ts#L67-L70) + [:260-265](src/services/compact/autoCompact.ts#L260-L265)）——2026-03 的一次事故里有 1,279 个会话连续失败 50+ 次，每天浪费 ~25 万次 API 调用。
-
-Prompt cache 优化：`tengu_compact_cache_prefix` gate 让压缩 fork 共享主会话的 prompt prefix，从 98% cache miss 降到大幅命中（[compact.ts:431-438](src/services/compact/compact.ts#L431-L438)）。
-
-#### ⑥ reactiveCompact —— 413 兜底（ant-only）
-
-不在预处理里跑，而是**等 API 真的返回 `prompt_too_long` 再触发**，位置在 [query.ts:1119-1175](src/query.ts#L1119-L1175)。
-
-- 流程里先 `withhold` 住这条错误消息不 yield 给 UI；
-- 调 `tryReactiveCompact()`，成功就用 post-compact messages 替换历史、`continue` 重试当前 turn；
-- 失败才 yield 出原错误。
-
-还有 `max_output_tokens` 恢复路径（[query.ts:1188-1256](src/query.ts#L1188-L1256)）：
-- 第一次遇到 → 把 `maxOutputTokensOverride` 从 8k 升到 64k 重试**同一请求**。
-- 再失败 → 注入 "Output token limit hit. Resume directly" 的 user meta message，让模型多轮接龙续写（最多 `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` 次）。
-
-### 3. 压缩结果的"边界消息"
-
-每次压缩（auto / manual / snip / microcompact）都生成一条 `SystemCompactBoundaryMessage`，[compact.ts:598](src/services/compact/compact.ts#L598) `createCompactBoundaryMessage`。它：
-
-- 作为消息数组里**真实存在**的一条记录，界定"这之前已压缩 / 之后是新对话"。
-- `compactMetadata` 带 `trigger: 'auto' | 'manual'`、`preCompactTokenCount`、`preservedSegment` (保留原消息 UUID 链接用于 resume)。
-- REPL 用 `getMessagesAfterCompactBoundary()`（[query.ts:365](src/query.ts#L365)）每次 API 请求只发边界之后的消息。
-- `/resume` 时根据 `preservedSegment` 的 `headUuid/anchorUuid/tailUuid` 重建消息拓扑（[compact.ts:349](src/services/compact/compact.ts#L349) `annotateBoundaryWithPreservedSegment`）。
-
-### 4. 一张决策图
+**流程**：
 
 ```
-每轮 query loop 开头:
-  messages[]
-     │
-     ▼
-  ① applyToolResultBudget      ←─ 单条 user message 字节超限？
-     │                              ↓ yes: content → 持久化指针
-     ▼
-  ② HISTORY_SNIP (feature)     ←─ 裁最老几条
-     │
-     ▼
-  ③ microcompact
-     ├ time-based: 空闲 N min? ── 清旧 tool_result content
-     └ cached MC:  数量超阈值?  ── 发 cache_edits，服务器删
-     │
-     ▼
-  ④ CONTEXT_COLLAPSE (feature) ←─ 中间段折叠成摘要
-     │
-     ▼
-  ⑤ autocompact
-     │   tokenCount >= threshold?
-     │     ↓ yes
-     │   trySessionMemoryCompaction → 成功 return
-     │     ↓ fail
-     │   compactConversation
-     │     - PreCompact hooks
-     │     - fork agent 生成 summary (9 段结构)
-     │     - 清 readFileState，重新 attach 文件
-     │     - 生成 boundaryMarker
-     │     - SessionStart hook
-     │   → 失败 3 次熔断
-     │
-     ▼
-  → API request
-     ↓ 返回 413?
-  ⑥ reactiveCompact (withhold 住 error，重试 compact 再 continue)
-     ↓ 返回 max_output_tokens?
-     escalate 8k → 64k → "resume" user meta → 多轮续写
+executePreCompactHooks
+↓
+setStreamMode('requesting')
+↓
+preCompactTokenCount = estimate
+↓
+PTL-retry loop (最多 3 次)：
+  streamCompactSummary() 
+    ├─ forkedAgent path（默认，cache 共享）
+    └─ streaming fallback（重试 2 次）
+  if PTL error → truncateHeadForPTLRetry() → 重试
+↓
+clear readFileState
+↓
+parallel: createPostCompactFileAttachments + createAsyncAgentAttachmentsIfNeeded
+↓
+追加 plan/skill/tools/agents/mcp delta attachments
+↓
+processSessionStartHooks('compact')
+↓
+createCompactBoundaryMessage with preCompactDiscoveredTools
+↓
+truePostCompactTokenCount = roughTokenCountEstimationForMessages
+↓
+logEvent('tengu_compact', {...})
 ```
 
-### 5. 关键设计点
+**streamCompactSummary 的 forkedAgent 路径**：调 `runForkedAgent()`，关键参数：
+- `canUseTool: createCompactCanUseTool()` — 拒绝一切工具
+- `querySource: 'compact'` — 防递归
+- `maxTurns: 1` — 一轮出结果
+- `skipCacheWrite: true` — 不污染缓存
+- **不设 `maxOutputTokens`** — 保持 cache key 与主线对齐
+- 命中事件：`tengu_compact_cache_sharing_success`
+- 降级事件：`tengu_compact_cache_sharing_fallback`
 
-1. **分层 vs 一刀切**：从"替换一个 tool result"到"整段 summary"，同一会话里多层机制并存，按 token 压力**逐级升级**。
-2. **Prompt cache 友好**：`ContentReplacementState` 用 `seenIds` 冻结决策，`cached microcompact` 直接用服务器侧 cache_edits，`tengu_compact_cache_prefix` 让 compact fork 共享主会话前缀——尽一切可能避免 cache 失效。
-3. **前置 vs 反应式**：多数层是 pre-request 预防；reactive compact 只在 API 真失败才触发，作为 413 的最后防线。
-4. **熔断 + 追踪**：`AutoCompactTrackingState.consecutiveFailures` + `turnId/turnCounter` 既防死循环，又能让 `tengu_compact` 事件区分 same-chain loop vs cross-agent vs 手动 compact。
-5. **可恢复边界**：所有压缩都产生 boundary message 并保留原消息 UUID，`/resume`、`--continue`、teleport 能精确重建拓扑。
+**truncateHeadForPTLRetry 算法**：
+1. 解析 `getPromptTooLongTokenGap(error)` 拿到要砍的 token 量
+2. 用 `groupMessagesByApiRound` 分组
+3. 累加丢弃直到覆盖 gap
+4. fallback：解析失败则砍前 20%
+5. 下限：保留 ≥1 组、丢 ≥1 组
+6. 若砍完首条变 assistant，前置 `PTL_RETRY_MARKER` 伪 user 消息
+7. 记 `tengu_compact_ptl_retry`
+
+**buildPostCompactMessages 顺序**：
+
+```
+[boundaryMarker, ...summaryMessages, ...messagesToKeep, ...attachments, ...hookResults]
+```
+
+**annotateBoundaryWithPreservedSegment**：打 `{headUuid, anchorUuid, tailUuid}` 三锚点，多次压缩时仍能定位。
+
+**createPostCompactFileAttachments 预算逻辑**：
+- 选 `readFileState` 中时间戳最新的 5 个文件
+- 每文件按 5K token 截断
+- 总预算 50K token
+- 调 `collectReadToolFilePaths(preservedMessages)` 去重
+- 排除 plan 文件和 CLAUDE.md（独立通道恢复）
+
+### 7. sessionMemoryCompact（实验性）
+
+`/src/services/compact/sessionMemoryCompact.ts` 的 `trySessionMemoryCompaction()` 是 0 次 LLM 调用的捷径。
+
+触发条件：`tengu_session_memory` + `tengu_sm_compact` 双 GrowthBook flag。
+
+GrowthBook 配置：
+- `minTokens: 10_000`
+- `minTextBlockMessages: 5`
+- `maxTokens: 40_000`
+
+`calculateMessagesToKeepIndex()` 从 `lastSummarizedMessageId` 反扩，用 `adjustIndexToPreserveAPIInvariants()` 防止切断 tool_use/tool_result 对和共享 message.id 的 thinking 块。
+
+返回 `null` 表示不适用，autoCompact 回落到完整 `compactConversation`。
+
+### 8. apiMicrocompact（服务端）
+
+`/src/services/compact/apiMicrocompact.ts` 的 `getAPIContextManagement()` 在请求载荷里附 `context_management` 字段，由服务端执行 edits：
+
+**clear_thinking_20251015**：保留全部 thinking 或仅最近一轮（取决于 1 小时 cache miss 状态）。
+
+**clear_tool_uses_20250919**（ant-only）：
+- `trigger: { type: 'input_tokens', value: 180_000 }`
+- 目标：砍回 `180_000 - 40_000 = 140_000`
+- 清理白名单（content）：SHELL、GLOB、GREP、FILE_READ、WEB_FETCH、WEB_SEARCH
+- 排除（tool_use 本身）：FILE_EDIT、FILE_WRITE、NOTEBOOK_EDIT（写操作不能删）
+
+### 9. reactive-compact 与 blocking-limit
+
+`tryReactiveCompact`（feature 门控）：API 返回 413 / media_size_error 且开关打开时触发，置 `hasAttemptedReactiveCompact = true` 防重试。
+
+`blocking-limit check`（line 637）：扣除 `snipTokensFreed` 后判定 `isAtBlockingLimit`，yield `PROMPT_TOO_LONG_ERROR_MESSAGE`，return `{ reason: 'blocking_limit' }`。
+
+### 10. postCompactCleanup
+
+`/src/services/compact/postCompactCleanup.ts` 的 `runPostCompactCleanup(querySource?)`：
+- `resetMicrocompactState()`
+- `resetContextCollapse()`（feature gated，主线专属）
+- `getUserContext.cache.clear()` + `resetGetMemoryFilesCache('compact')`
+- `clearSystemPromptSections()`、`clearClassifierApprovals()`、`clearSpeculativeChecks()`
+- `clearBetaTracingState()`、`sweepFileContentCache`、`clearSessionMessagesCache()`
+- **故意不调** `resetSentSkillNames()`（避免重复注入 4K token skill listing）
+
+### 设计观察
+
+**渐进放弃**：每一层放弃得更多但触发成本更高，按"放弃信息量 vs 保留缓存"做帕累托排序。
+
+**Prompt cache 是一等公民**：forkedAgent 不设 maxOutputTokens、cached-microcompact 走 cache_edits、partialCompact 默认 'from' 方向、sessionMemory 反扩——都在维护前缀哈希。
+
+**熔断与递归保护**：`MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3`、querySource 排除、`hasAttemptedReactiveCompact` 一次性。
+
+**API 契约执行者**：user-first、tool_use ↔ tool_result 配对、message.id 整体性——`groupMessagesByApiRound`、`adjustIndexToPreserveAPIInvariants`、PTL 伪 marker 都是为此。
+
+**可观测性**：`tengu_compact`、`tengu_compact_ptl_retry`、`tengu_cached_microcompact`、`tengu_compact_cache_sharing_*` 等独立事件维度。
+
+**Feature flag + DCE**：`HISTORY_SNIP`、`CONTEXT_COLLAPSE`、`REACTIVE_COMPACT`、`CACHED_MICROCOMPACT` 等通过 Bun tree-shaking 在不同 build 中差异化呈现。
+
+**压缩 = 新会话**：成功后调 `processSessionStartHooks('compact')` 重新注入 plan/skill/tools delta，从 LLM 视角等同于"带记忆的新会话启动"。
 
 ---
 
-## 六、Context Collapse 详解（feature-gated）
+## 三、React/Ink 终端应用
 
-### 1. 是什么
+### Ink 是什么
 
-**Context Collapse 是一种"细粒度、读时投影、段级、不破坏滚屏"的压缩机制**，比 autocompact 更轻：autocompact 把整段历史压成一个 summary，collapse 则**挑历史里的若干"段"(span)替换成 `<collapsed id="...">summary</collapsed>` 占位符**。
+React 三段式架构：虚拟 DOM → reconciler → renderer。React 自己只做前两段，最后一段可换：
+- `react-dom` → 浏览器 DOM
+- `react-native` → 移动原生视图
+- **`ink` → 终端**
 
-⚠️ `services/contextCollapse/` 目录在外部 build 里被 `feature('CONTEXT_COLLAPSE')` DCE 掉了，本镜像没有实际实现文件。下面分析基于：
-- [query.ts:18-19](src/query.ts#L18-L19) 的 `require()`
-- [query.ts:440-447](src/query.ts#L440-L447) 调用点
-- [types/logs.ts:240-295](src/types/logs.ts#L240-L295) 持久化条目类型
-- [autoCompact.ts:174-182, 215-223](src/services/compact/autoCompact.ts#L174-L182) 让位逻辑
-- [analyzeContext.ts:1119-1126](src/utils/analyzeContext.ts#L1119-L1126) UI 集成
-- [REPL.tsx:3677-3688](src/screens/REPL.tsx#L3677-L3688) rewind 处理
-- [sessionStorage.ts:1208-1215, 3694-3697](src/utils/sessionStorage.ts#L1208-L1215) resume 重放
+Ink 把 JSX（`<Box>`、`<Text>`）喂给自定义 reconciler，用 **Yoga 布局引擎**（Facebook React Native 的 Flexbox C++ 实现）算字符网格坐标，diff 后通过 ANSI 转义序列写到 stdout。终端成了一块字符像素屏，Ink 是图形驱动。
 
-### 2. 核心数据结构
+### Claude Code 的深度定制
 
-每个 commit = "把 [firstArchivedUuid, lastArchivedUuid] 这段消息**视为**一个折叠占位符"：
+仓库里 `/src/ink/ink.tsx` 是 **fork 并重写的 Ink**，不是 npm 上的包。相关文件：
+- `reconciler.ts`、`renderer.ts`、`screen.ts`
+- `selection.ts`、`hit-test.ts`、`searchHighlight.ts`
+- `termio/csi.ts`、`termio/dec.ts`、`termio/osc.ts`
 
-```ts
-type ContextCollapseCommitEntry = {
-  type: 'marble-origami-commit',          // 'marble_origami' 是内部代号
-  collapseId: string,                      // 16 位折叠 ID
-  summaryUuid: string,                     // 摘要占位符的 uuid
-  summaryContent: string,                  // <collapsed id="...">text</collapsed> 完整串
-  summary: string,                         // 纯文本摘要（给 ctx_inspect 用）
-  firstArchivedUuid: string,               // ★ span 起点
-  lastArchivedUuid: string,                // ★ span 终点
-}
+实现了：终端 I/O 协议、鼠标点击命中测试、文本选区、超链接池、搜索高亮、滚动捕获——已经是**字符画 GUI**。
 
-type ContextCollapseSnapshotEntry = {
-  type: 'marble-origami-snapshot',
-  staged: Array<{
-    startUuid: string,
-    endUuid: string,
-    summary: string,
-    risk: number,                          // ★ 折叠风险评分
-    stagedAt: number,                      // ★ 入队时间
-  }>,
-  armed: boolean,                          // 触发器是否已 armed
-  lastSpawnTokens: number,                 // 上次 spawn 时的 token 数
-}
+### 组件化 TUI
+
+```tsx
+<Box flexDirection="column">
+  <ThinkingIndicator active={isThinking} />
+  <ToolUseList tools={inProgressTools} />
+  <TokenBudgetBar used={tokens} max={contextWindow} />
+  <InputPrompt onSubmit={handleSubmit} />
+</Box>
 ```
 
-**关键事实**：
-- **archived 消息不持久化** —— 它们已经在 transcript 里以原始形式存在
-- **collapse store** 是独立的 module-level 状态，存 commit list + staged queue + spawn state
-- 两份数据**永不合并到磁盘**
+仓库里大量 `.tsx`：`tools/WebSearchTool/UI.tsx`、`tools/SkillTool/UI.tsx`、`components/StructuredDiff.tsx`、`components/StatusNotices.tsx`——每个工具、每个 notice、每个权限 prompt 都是独立组件。
 
-### 3. 读时投影 —— `projectView`
+### 终端能力 hook 化
 
-```
-原始消息数组（REPL 持有）
-   m1, m2, m3, m4, m5, m6, m7, m8, m9, m10
-                  ▲              ▲
-              first(uuid)   last(uuid)
-                  └──── commit A ────┘ summary="..."
-
-projectView(messages, collapseStore) =
-   m1, m2, [<collapsed id="A">summary</collapsed>], m8, m9, m10
-                    ↑ 不存在于 messages 数组,
-                       是投影时从 collapse store 拼进来的
+`/src/ink/hooks/use-input.ts` 暴露 `useInput(handler)`：
+```tsx
+useInput((input, key) => {
+  if (key.escape) cancel()
+})
 ```
 
-**REPL UI 看完整原始版本**，**API 看投影后的折叠版本**——透明压缩。
+类似还有 `useFocus`、`useTerminalSize`、`useStdout`——把终端底层能力装进 React 状态机。
 
-### 4. ctx-agent 工作链路
+### 与 Agent Loop 解耦
 
-代号 **`marble_origami`**（[autoCompact.ts:174-182](src/services/compact/autoCompact.ts#L174-L182)），是个**后台 fork agent**：
+UI 循环和 Agent Loop 是两条独立异步流。`QueryEngine.submitMessage()` 是 AsyncGenerator，UI 用 `useEffect` 订阅：
 
-```
-1. 主会话每涨 token / 每过几轮
-   ↓
-2. ctx-agent armed (snapshot.armed = true)
-   ↓
-3. 后台 fork: 让 ctx-agent 扫一段历史
-   ↓
-4. 它产出若干 candidate span,每个有:
-   - [startUuid, endUuid] 边界
-   - summary（一句话总结这段做了什么）
-   - risk（折叠这段会丢多少信息）
-   ↓
-5. 进 staged 队列（还没生效）
-   ↓
-6. applyCollapsesIfNeeded 在每轮 query 开头:
-   - 看 token 压力
-   - 从 staged 里挑 risk 最低的若干 span 提交（commit）
-   - commit 的 span 立刻进入 projectView
-   ↓
-7. 持久化到 transcript
-   （marble-origami-commit / -snapshot 两类条目）
-```
-
-### 5. `applyCollapsesIfNeeded` 的内部步骤
-
-调用签名 ([query.ts:440-447](src/query.ts#L440-L447))：
-
-```ts
-applyCollapsesIfNeeded(
-  messagesForQuery: Message[],
-  toolUseContext: ToolUseContext,
-  querySource: QuerySource,
-): { messages: Message[] }
-```
-
-按周边代码反推：
-
-1. **`projectView(messagesForQuery)`** —— 读 collapse store 的 commit 列表，把 `[firstArchivedUuid, lastArchivedUuid]` 之间的消息**替换**成 `<collapsed id="...">summary</collapsed>` user message。
-2. **算当前 token** —— `tokenCountWithEstimation(projectedMessages)`。
-3. **决定要不要 commit 更多 staged span**：90% 开始 commit 低风险的，95% 阻塞性 commit。
-4. **新 commit 的 span 通过 `appendEntry` 持久化**到 transcript。
-5. **返回**包含投影后消息的 `{ messages }`。
-
-注意函数**不 yield 任何东西**——整个 collapse 对 UI 透明。UI 只在 `/context` 命令里显式调 `projectView` 才能看到投影视图（[context.tsx:20-26](src/commands/context/context.tsx#L20-L26)）。
-
-### 6. 与 autocompact 的让位关系
-
-[query.ts:428-431](src/query.ts#L428-L431) 的注释点明了 collapse 存在的全部价值：
-
-> Runs BEFORE autocompact so that if collapse gets us under the autocompact threshold, autocompact is a no-op and we keep granular context instead of a single summary.
-
-```
-传统:
-  history (180k) ──autocompact──► [ summary (17k) + recent (50k) ]
-                                         ↑
-                                  整个历史变成一个粗摘要
-
-Collapse:
-  history (180k) ──collapse──► [ early-msgs (20k) + <collapsed A> + 
-                                  middle-msgs (15k) + <collapsed B> + 
-                                  recent (50k) ]
-                                         ↑
-                                  保留全部细节脉络,
-                                  只折叠"已不重要"的中段
-```
-
-互斥关系：
-- `shouldAutoCompact` ([autoCompact.ts:215-223](src/services/compact/autoCompact.ts#L215-L223))：collapse 启用时 autocompact **完全让位**。
-- `analyzeContext.ts:1119-1126`：UI 不显示 autocompact 的预留 buffer。
-- ContextVisualization.tsx 改用 collapse 自己的阈值梯度。
-
-### 7. 413 兜底路径
-
-[query.ts:1085-1117](src/query.ts#L1085-L1117) —— API 真返回 413 时：
-
-```ts
-if (isWithheld413) {
-  if (feature('CONTEXT_COLLAPSE') && contextCollapse &&
-      state.transition?.reason !== 'collapse_drain_retry') {
-    const drained = contextCollapse.recoverFromOverflow(messagesForQuery, querySource)
-    if (drained.committed > 0) {
-      state = {
-        ...,
-        messages: drained.messages,
-        transition: { reason: 'collapse_drain_retry', committed: drained.committed },
-      }
-      continue                           // 重试本轮
+```tsx
+useEffect(() => {
+  (async () => {
+    for await (const msg of queryEngine.submitMessage(input)) {
+      setMessages(prev => [...prev, msg])
     }
-  }
-}
+  })()
+}, [input])
 ```
 
-**`recoverFromOverflow`** —— 把 staged 队列里**所有**没 commit 的 span 强制全部 commit，重新投影，重试请求。`transition.reason === 'collapse_drain_retry'` 标记防止"drain → 仍 413 → 再 drain"死循环。
+权限询问是会合点：Agent Loop 在需要许可时塞一个待办 → UI 渲染 yes/no → 用户按键 resolve Promise → 答案回到 Agent Loop。
 
-### 8. Rewind / Resume 处理
+### 总结
 
-**Rewind**（[REPL.tsx:3677-3688](src/screens/REPL.tsx#L3677-L3688)）必须 `resetContextCollapse()`：
-
-> Commits whose archived span was past the rewind point can't be projected anymore (projectView silently skips them) but the staged queue and ID maps reference stale uuids. Simplest safe reset: drop everything.
-
-**Resume** ([sessionStorage.ts:3694-3697](src/utils/sessionStorage.ts#L3694-L3697)) 反过来加载：
-
-```ts
-} else if (entry.type === 'marble-origami-commit') {
-  // 加载到 commit log（按顺序）
-} else if (entry.type === 'marble-origami-snapshot') {
-  // 加载 staged + armed + lastSpawnTokens（last-wins）
-}
-```
-
-恢复后：commit list 重放、staged 队列重新填充、ctx-agent 从 `lastSpawnTokens` 接着累计。
-
-### 9. 与 SessionMemory 的对比
-
-| | SessionMemory | Context Collapse |
-|---|---|---|
-| 维护对象 | 一个固定结构的 `summary.md` markdown 文件 | 多个独立的 commit（每个对应一段 span） |
-| 触发时机 | 每涨 N token + N tool call 的 hook | ctx-agent 后台 spawn + applyCollapsesIfNeeded 提交 |
-| 折叠粒度 | 整段历史 → 一份笔记 | **段级**——可以折叠多个独立区间 |
-| 保留细节 | 笔记是高度概括的 9 段总结 | **保留段间的具体消息**，仅折叠选中段 |
-| 替换内容 | 替换整段历史 | 替换 [start, end] 之间的具体消息为 `<collapsed>` |
-| 持久化 | 单个 `summary.md` 文件 | `marble-origami-commit` + `marble-origami-snapshot` 两类 transcript entries |
-| 用法 | `trySessionMemoryCompaction` 走整段替换 | `applyCollapsesIfNeeded` 做读时投影 |
-| 透明度 | 被压缩消息**消失**（用 messagesToKeep 保最近的） | 原消息留在 REPL 滚屏，仅投影时替换 |
-
-### 10. 代号 `marble_origami` 的来历
-
-- **marble**（大理石）：每个 collapse commit 是一块独立的、不可变的"石头"
-- **origami**（折纸）：把一段消息"折"成一个紧凑表示
-
-[types/logs.ts:249-253](src/types/logs.ts#L249-L253) 的注释解释为什么必须用混淆字符串：
-
-> Discriminator is obfuscated to match the gate name. sessionStorage.ts isn't feature-gated, so a descriptive string here would leak into external builds via the appendEntry dispatch / loadTranscriptFile parser even though nothing in an external build ever writes or reads this entry.
-
-字面量字符串会被外部构建引用到，所以用代号防泄密——典型的 ant-only feature 处理。
-
-### 11. 一图概括
-
-```
-                  ┌──────────────────────────────────┐
-                  │     主会话 messages 数组         │
-                  │     m1, m2, m3, m4, m5, m6 ...   │  ◄── REPL UI 显示这个
-                  └──────────────────────────────────┘
-                                    │
-                ctx-agent (后台)    │
-                    │               │
-                    ▼               │
-                ┌─────────┐         │
-                │ staged  │ <span, │
-                │ queue   │  risk> │
-                └─────────┘         │
-                    │               │
-                    ▼               │
-              applyCollapsesIfNeeded
-                    │               │
-                    ▼               │
-                ┌──────────────────────────┐
-                │ collapse store (commit log)│
-                │ [{startUuid, endUuid,    │
-                │   summaryContent}, ...]  │
-                └──────────────────────────┘
-                    │               │
-                    ▼               ▼
-              projectView(messages, store)
-                    │
-                    ▼
-            ┌─────────────────────────────┐
-            │ messagesForQuery（投影版本） │
-            │ m1, m2, <collapsed A>,      │
-            │ m5, <collapsed B>           │  ◄── 发给 API 的是这个
-            └─────────────────────────────┘
-```
+**Claude Code = 在终端里运行的 GUI 程序，UI 用 React 声明式描述，Ink 把 React 树翻译成 ANSI 控制序列**。它不是传统 "print → readline → print" 的 CLI，而是全屏接管终端、有焦点管理、有鼠标事件、有字符级增量渲染的交互式 TUI。同一份业务代码（QueryEngine、queryLoop、压缩链路）能同时支撑交互模式、headless 模式和 SDK 嵌入模式。
 
 ---
 
-## 七、一句话总结
+## 四、Client SDK vs Agent SDK vs Claude Code CLI
 
-Claude Code 是一个 **React/Ink 终端应用 + 自研 agent loop + 40+ 工具生态 + 企业级配置/权限/遥测栈**，所有模式（REPL、headless SDK、KAIROS、coordinator）共享同一个 `QueryEngine` → `query()` 核心生成器。代码量真正集中在 [main.tsx](src/main.tsx)、[query.ts](src/query.ts)、[REPL.tsx](src/screens/REPL.tsx)、[AgentTool.tsx](src/tools/AgentTool/AgentTool.tsx)、[BashTool.tsx](src/tools/BashTool/BashTool.tsx) 这五个文件（合计 ~14000 行），其余是辅助基础设施。
+### 抽象栈
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Claude Code CLI   ← 终端 TUI + Agent Loop + 工具 + UI 全套         │  用户
+├──────────────────────────────────────────────────────────────────┤
+│ Agent SDK         ← Agent Loop + 工具 + 上下文管理（无 UI）         │  开发者（产品代码）
+├──────────────────────────────────────────────────────────────────┤
+│ Client SDK        ← 只有 API 调用封装(messages.create)             │  开发者（底层代码）
+├──────────────────────────────────────────────────────────────────┤
+│ Anthropic HTTP API ← 原始 REST                                    │  协议
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 边界对比表
+
+| 维度 | Client SDK | Agent SDK | Claude Code CLI |
+|---|---|---|---|
+| API 调用 | 你来 | SDK 内部 | SDK 内部 |
+| Agent Loop（tool_use 循环） | **你写** | 内置 | 内置 |
+| 内置工具 | 无 | 40+ 个 | 40+ 个 |
+| 权限系统 | 无 | 可编程 canUseTool | 交互式 prompt + 配置 |
+| 上下文压缩 | 你来 | 内置六级流水线 | 内置 |
+| MCP 集成 | 无 | 内置 | 内置 |
+| Subagent / forked agent | 无 | 内置 Task 工具 | 内置 |
+| UI 层 | 无 | **无** | React/Ink TUI |
+| 会话持久化 | 无 | 可选 | 默认开启 |
+| 斜杠命令 / plugin / hooks | 无 | 部分（hooks） | 全部 |
+| 入口 | `client.messages.create()` | `query({...})` AsyncGenerator | `claude` 命令 |
+| 最适合 | 非 agent 应用 | 嵌进自家产品 | 终端交互 |
+
+### 三段代码形态
+
+**Client SDK**：
+
+```typescript
+let resp = await client.messages.create({ model, tools, messages });
+while (resp.stop_reason === 'tool_use') {
+  const results = await Promise.all(
+    resp.content
+      .filter(b => b.type === 'tool_use')
+      .map(async b => ({ tool_use_id: b.id, content: await myTools[b.name](b.input) }))
+  );
+  messages.push({ role: 'assistant', content: resp.content });
+  messages.push({ role: 'user', content: results.map(r => ({ type: 'tool_result', ...r })) });
+  resp = await client.messages.create({ model, tools, messages });
+}
+```
+
+**Agent SDK**：
+
+```typescript
+for await (const msg of query({
+  prompt: "Fix the bug in auth.ts",
+  options: { cwd, allowedTools: ['Read','Edit','Bash'], canUseTool: myGate }
+})) {
+  console.log(msg);
+}
+```
+
+**Claude Code CLI**：
+
+```bash
+$ claude
+> Fix the bug in auth.ts
+```
+
+### 选型决策
+
+| 场景 | 推荐 | 理由 |
+|---|---|---|
+| Interactive development | CLI | 看中间过程、迭代 prompt、人在回路批准 |
+| One-off tasks | CLI | `claude -p` 一行命令最快 |
+| CI/CD pipelines | SDK | 编程控制退出码、日志、错误处理 |
+| Custom applications | SDK | 自家产品 UI 嵌入 agent |
+| Production automation | SDK | 稳定性、可观测性、可测试性 |
+
+**先问"是不是 agent 任务"**：不是 → Client SDK；是 → 再问要不要终端交互：要 → CLI，不要 → Agent SDK。
+
+### 一句话
+
+**Client SDK 给你 API；Agent SDK 给你 Agent；Claude Code CLI 给你一个装着 Agent 的终端应用。** 三者核心差异是"谁拥有那个 `while (stop_reason === 'tool_use')` 循环"——你、SDK、还是 CLI。
+
+---
+
+## 五、为什么 npm 包会被称为"源码泄露"
+
+### npm 发布的不是源码
+
+```
+src/*.ts ──编译──> dist/*.js ──bundle──> cli.bundle.js ──minify──> cli.min.js
+  ↑                ↑                      ↑                         ↑
+ 你写的           编译产物               单文件打包                   压缩混淆
+ 易读             仍可读                 模块边界消失                 几乎不可读
+```
+
+Claude Code 用 **Bun 打包器**把几百个 `.ts/.tsx` 合成一个 cli.js：
+- 所有 `import` 内联展开
+- `feature()` 门控里走不到的分支 tree-shaking 掉
+- 变量名 minify 成 `a`、`b`、`_0x123`
+- TS / JSX 语法擦除
+- 注释删除
+- 字符串提到常量池
+
+`npm install` 拿到的就是这坨 minified bundle。理论上是文本，但和源码不是一回事。
+
+### Source map 撕开了黑盒
+
+Bundler 生成 `cli.js.map` 用于调试时反向映射回源文件。**关键是 source map 规范的 `sourcesContent` 字段装的是原始源码字符串**——为了在没有本地工作副本时也能调试。
+
+一旦某个商业 npm 包发布时把 source map 也打进去了，源码就跟着走了：
+
+```
+npm pack @anthropic-ai/claude-code   # 拿到 tarball
+解压 → 找到 cli.js.map
+用 webcrack / sourcemap-unpack 解出 sourcesContent
+↓
+得到几百个原始 /src/*.ts 文件 —— 这就是你我现在翻的这份代码
+```
+
+### 为什么会这样发布
+
+通常不是主动开源，是几种情况之一：
+
+1. **构建配置遗漏**：`sourceMap: true` 没显式关
+2. **Sentry 集成失配**：上传顺序错或同时进了发布包
+3. **调试需要**：CLI 工具 stack trace 对用户体验很重要——`QueryEngine.ts:456` 比 `cli.min.js:1:384572` 有用得多
+
+业界观察 Claude Code 接近第三种：Anthropic 应清楚源码会被还原，选择了"可读 > 保密"的取舍。真正的 secrets（API key、敏感 prompts）不会进 npm 包。
+
+### "可读"≠"可合法用"
+
+`@anthropic-ai/claude-code` 的 license 是 Anthropic 商业许可，不是 MIT/Apache。即使源码可还原：
+- 研究、学习、借鉴设计思想 — 通常没问题
+- 直接抄代码、fork 出去发布、嵌进自家闭源产品卖 — 违反许可
+
+### 一句话
+
+**npm 分发 JS ≠ 源码可读，source map 才是那座桥**。Claude Code 被称作"源码泄露"指的是随 npm 一起发布的 source map 让源码从产物形态退回到了源码形态。
+
+---
+
+## 六、Streaming 输入模式
+
+### `prompt` 的两种形态
+
+**字符串**（最简形态）：
+```typescript
+for await (const msg of query({ prompt: "Fix the bug in auth.ts" })) { ... }
+```
+
+**AsyncGenerator**（流式输入）：
+```typescript
+async function* generateMessages() {
+  yield { type: "user", message: { role: "user", content: "Analyze this codebase" }};
+  await new Promise(r => setTimeout(r, 2000));
+  yield { 
+    type: "user", 
+    message: { 
+      role: "user", 
+      content: [
+        { type: "text", text: "Review this diagram" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: ... }}
+      ]
+    }
+  };
+}
+
+for await (const message of query({
+  prompt: generateMessages(),
+  options: { maxTurns: 10, allowedTools: ["Read", "Grep"] }
+})) {
+  console.log(message);
+}
+```
+
+字符串 prompt 是退化的 AsyncGenerator——只 yield 一次就结束。
+
+### 双向流协议
+
+两条流首尾衔接：
+```
+你的 generator → SDK 消费 → agent loop → SDK 产生输出流 → 你的 for await 消费
+```
+
+互相背压：generator yield 不被 await 就停在 yield 那一行；输出流不被 for await 消费就 yielding 暂停。
+
+### 时序图各节点对应源码
+
+| 图中节点 | 对应源码 |
+|---|---|
+| Initialize with AsyncGenerator | `query()` 内部 `QueryEngine.submitMessage()` |
+| Yield Message 1 | `processUserInput` 注入 messages |
+| Execute tools | `runTools()` / `runToolUse()` |
+| Read files / Write files | 具体 Tool 的 `call()` 执行 |
+| Stream partial response | `queryModelWithStreaming` SSE 切片 |
+| Complete Message 1 | 一轮 queryLoop 结束（stop_reason: end_turn） |
+| Yield Message 2 + Image | generator 二次 yield，注入同一 session |
+| Queue Message 3 | commandQueue 排队（详见第七章） |
+| Interrupt/Cancel | AbortController.abort |
+| Handle interruption | 工具收到 signal、loop 提前跳出 |
+| Session stays alive | session ID、文件状态、history 不重启 |
+| Persistent file system state | 工具改真实磁盘文件，跨消息累积 |
+
+### 为什么这样设计
+
+字符串 prompt 只能写"问→答→问→答"。流式 prompt 让：
+
+1. **agent 跑的过程中追加输入**：示例的"先扫安全 → 2 秒后附架构图"无需重构上下文
+2. **外部事件作输入源**：generator 里可以是 `await fromKafka()`、`await webhook.next()`、`await waitForUserApproval()`——agent 挂在任何事件总线上响应
+
+### `options` 是流的全局约束
+
+`maxTurns: 10` 限制 queryLoop 迭代次数；`allowedTools: ['Read','Grep']` 通过 `getTools(ctx)` 过滤工具池。这两条与流式 prompt 正交：**一份配置 + 一条输入流 + 一条输出流**。
+
+### 一句话
+
+**字符串 prompt 是 AsyncGenerator prompt 的退化情况**。理解 SDK 的输入是流不是值，"long-running agent"、"event-driven agent"、"multi-modal mid-conversation injection" 都自然落到同一抽象。这是 Agent SDK 区别于 Client SDK 最深刻处——**它不是帮你少写循环，是帮你把 agent 接入任何事件源**。
+
+---
+
+## 七、Agent 执行中的用户输入处理
+
+### 核心数据结构：模块级 commandQueue
+
+`/src/utils/messageQueueManager.ts`：
+
+```typescript
+const commandQueue: QueuedCommand[] = []
+```
+
+**与 React 完全无关的、模块全局的命令队列**。承载所有"想被 agent 处理的命令"——用户 prompt、任务通知、悬空权限请求都进同一队。
+
+优先级：`'now' > 'next' > 'later'`。
+- `'next'`：用户输入默认
+- `'later'`：后台任务通知
+- `'now'`：紧急注入
+
+相同优先级 FIFO。
+
+### 双消费者模型
+
+队列在模块层，因为既要被 React（`useSyncExternalStore` + `subscribeToCommandQueue`）订阅，又要被非 React 代码（`print.ts` 流式循环）读取。每次 mutation 调 `notifySubscribers()` 重建冻结 snapshot。
+
+### 场景 A：用户敲完一段 + 按 Enter
+
+```
+键盘 → useInput → 输入框累积 → Enter → handlePromptSubmit → enqueue
+                                                                ↓
+                                              notifySubscribers
+                                                                ↓
+                              REPL useEffect 醒来，但 isQueryActive === true
+                                                                ↓
+                                       UI 渲染 "queued: ..." 预览
+                                                                ↓
+                                         (当前回合跑完)
+                                                                ↓
+                                  popAllEditable(inputValue, 0)   line 2167
+                                                                ↓
+                              所有可编辑命令拼成新 prompt → onQuery()
+```
+
+**多条排队会被合并**而不是分别处理三次——同一上下文的连续追加意图，分别处理会做无用功。
+
+### 场景 B：用户按 ESC
+
+```typescript
+abortController?.abort('user-cancel')   // line 2147, 2152
+```
+
+每个 `onQuery()` 新建 AbortController，signal 传到所有可能阻塞处：
+- `queryModelWithStreaming(..., { signal })` — 立即停 SSE
+- 每个工具 `call()` 的 ctx 带 abortController — 长任务自杀
+- `runTools` 批次循环每次检查 signal
+
+**ESC 不退出会话**——session ID、文件状态、history 都还在。如果队列还有排队命令，默认还会调 `clearCommandQueue()`。
+
+### 场景 C：打字但没回车
+
+`useInput` 捕获键盘事件，输入框 React state 累积。**完全是 UI 本地行为，agent lifeline 感知不到**。
+
+按 UP 键或空输入框 ESC 触发 `popAllEditable()` 反悔机制：
+```typescript
+const newInput = [...queuedTexts, currentInput].filter(Boolean).join('\n')
+```
+
+把队列文本拼到当前输入框前，光标重新计算，图片附件跟回。
+
+不可编辑的命令（系统注入、channel 消息）不会被 popAll 拉走。
+
+### 与 streaming AsyncGenerator 的关系
+
+时序图里 "Queue Message 3" 对应的就是 commandQueue。SDK 模式 generator yield = enqueue，CLI 模式键盘 Enter = enqueue。**不同输入源，同一队列，同一 dequeue 节奏**。
+
+```
+键盘事件 → InputBox → handlePromptSubmit → enqueue
+                                            ↓
+                                  (between turns)
+                                            ↓
+                            popAllEditable / dequeue → onQuery → query()
+```
+
+### 设计要点
+
+**优先级三档**：用户敲键盘永远不会被后台 cron 提醒挤掉。
+
+**队列在模块层、UI 在 React 层**：避免 agent 跑到一半冲掉 React state。
+
+**dequeue 在回合间隙**：模型每轮看到稳定快照，不是流动目标。
+
+**ESC 分级**：打字时撤回；agent 跑时 abort；abort 后清队列。
+
+### 一句话
+
+**用户在 agent 执行时输入新内容，先进入全局命令队列，agent 不会被立刻打断（除非按 ESC）；当前回合跑完后，所有排队的可编辑命令一次性合并成下一轮输入。** 这条队列把"流式输入"和"回合制 agent 循环"两种节奏耦合起来——这是 Claude Code 在终端里表现得像"实时对话"、底层却是"严格回合制 LLM 调用"的关键。
+
+---
+
+## 八、LSP 工具
+
+### 文本工具的局限
+
+LSP 工具出现前，Claude Code 看代码靠**纯文本手段**——Read、Grep、Glob。这套对"找一段代码"够用，对"理解代码"是瞎子。重命名 `User` 为 `Account` 时，正则会顺带改注释、字符串、变量名 `currentUser` 等等。
+
+### LSP 是什么
+
+**Language Server Protocol**，Microsoft 为 VS Code 设计、现成事实标准。把"语言相关智能能力"剥离成独立进程（language server），编辑器和 server 用 JSON-RPC 通信。
+
+| 语言 | Server |
+|---|---|
+| TypeScript | tsserver |
+| Python | pyright / pylsp |
+| Go | gopls |
+| Rust | rust-analyzer |
+| Java | jdtls |
+
+server 内置真正的语义理解：AST、类型推导、跨文件符号表、引用图。VS Code 的 F12 跳转、悬停看类型、自动重命名都靠 LSP。
+
+LSP 协议标准请求：`textDocument/definition`、`textDocument/references`、`textDocument/hover`、`textDocument/documentSymbol`、`workspace/symbol`、`textDocument/implementation`、`textDocument/diagnostic` 等。
+
+### Claude Code 的 LSP Tool
+
+`/src/tools/LSPTool/schemas.ts` 是单工具承载多 operation 的 discriminated union：
+
+```typescript
+operation: 'goToDefinition' | 'findReferences' | 'hover' 
+         | 'documentSymbol' | 'workspaceSymbol' | ...
+```
+
+模型给 `{operation, filePath, line, character}`，`/src/services/lsp/manager.ts` 翻译成 JSON-RPC 发给 language server，回复包成 tool_result。
+
+模型获得的能力：
+- **跳转定义**：编译器认证的真定义，不是搜索可能匹配
+- **找所有引用**：真正使用这个类型的所有位置（同名不同作用域不出现）
+- **悬停查类型**：完整类型信息含泛型展开和推导
+- **列文档符号 / 全局符号搜索**
+- **找实现**：interface 在哪些 class 里实现
+- **调用层级**：函数 A 被谁调用、调用谁
+
+### 杀手锏：edit 后自动喂 diagnostics
+
+Edit 工具写完文件后通过 LSP manager 推 `textDocument/didChange` 给 server，server 立即重做类型检查并返回 diagnostics。**Claude Code 把这些 diagnostics 拼进 Edit 的 tool_result**。
+
+效果：反馈循环从"改完→运行 build→看输出→再改"变成"改完→tool_result 直接说新引入了 3 个 type error"。**反馈延迟从分钟级降到亚秒级**。
+
+### Plugin 化的工程取舍
+
+不内置 server 二进制是因为：
+
+1. **体积**：每个 server 几十到几百 MB
+2. **版本耦合**：tsserver 要跟项目 TS 版本对齐才准确
+3. **可拓展性**：硬编码支持哪些语言不现实
+
+使用流程：装 "code intelligence plugin" → plugin 提供 server 启动配置 → 用户自己装 server binary。
+
+### 与 Grep / Read 的互补
+
+| 任务 | 用什么 | 为什么 |
+|---|---|---|
+| 找含某字符串的代码 | Grep | 快、跨语言 |
+| 找某符号的精确定义 | LSP goToDefinition | 走类型不被同名干扰 |
+| 改函数名所有调用点 | LSP findReferences | 不误改字符串和注释 |
+| 看变量推导出来什么类型 | LSP hover | Grep/Read 做不到 |
+| 调研第三方库 | Grep / Read | LSP 在 node_modules 里通常没索引 |
+| 改完看有没有破坏 | LSP diagnostics（自动） | 比 build 快几个数量级 |
+
+### 与工具系统的关系
+
+LSP Tool 遵循标准 `Tool<Input, Output>` 接口，特殊之处：
+
+1. **外部依赖进程**：language server 是长生命期子进程
+2. **默认禁用、按 plugin 启用**：没装 server 的语言对模型不可见
+3. **与 Edit 工具隐式耦合**：Edit 写完文件触发 LSP 通知 + diagnostics 拼回
+
+### 一句话
+
+**LSP 工具让 Claude 在改代码这件事上从"按字符串想"升级到"按符号想"，并把 IDE 的实时类型反馈接入到模型的 tool_result 流里**——把 Claude Code 从"高级 grep + sed"推向"真正能写工业代码的协作伙伴"。它让模型能用编译器的眼睛看代码。
+
+---
+
+## 九、Prompt Cache 机制
+
+### 核心定位
+
+**Prompt cache 是 Anthropic API 服务端的能力，不是 Claude Code 本地的**。客户端只是通过请求标记"使唤"它，缓存数据在 Anthropic 数据中心 GPU 显存/内存里，本地一字节都没存。
+
+### 缓存的是什么
+
+不是"字符串 → 回答"，是 **transformer 处理 prompt 前缀时计算的 KV cache**。
+
+每个 transformer 层在每个 token 位置算出 K（key）和 V（value）张量，是处理后续 token 的 attention 输入。Anthropic 服务端把"算到某位置时的整张 KV cache"存下来，下次同样前缀进来直接复用，省掉那部分 forward pass。
+
+寻址 key 是前缀字节哈希，value 是 KV cache 张量。**只能在服务端**——KV cache 是 GPU 私有张量，传不出来也没用。
+
+### 客户端怎么使唤
+
+API 协议的 `cache_control` 标记：
+
+```json
+{
+  "type": "text",
+  "text": "<long system prompt or tool definition>",
+  "cache_control": { "type": "ephemeral" }
+}
+```
+
+服务端看到标记就把"从 prompt 开头到这个 block 结尾"的前缀缓存。这个标记叫 **cache breakpoint**。
+
+`/src/services/api/promptCacheBreakDetection.ts`、`/src/services/api/claude.ts` 决定每次请求把 breakpoint 打哪。每请求最多 4 个，最佳布局：
+
+```
+[system prompt]                    ← breakpoint 1（几千字，session 内不变）
+[tool definitions]                 ← breakpoint 2（几万字，几乎不变）
+[stable conversation history]      ← breakpoint 3（已发生过的对话）
+[recent turns / new user message]  ← 不打 breakpoint，每次新算
+```
+
+### 命中条件：字节级前缀完全一致
+
+不是语义匹配，是字节级前缀匹配。**任何一个字符差异都 cache miss**。失效场景：
+
+- system prompt 加一行
+- 工具定义改一个描述字段
+- 早期消息被 microcompact 改了 content
+- prompt 里注入时间戳
+- 工具列表顺序变化
+- JSON 字段顺序变化
+
+这就是为什么压缩链路所有策略都"避免改动前缀字节"——cached-microcompact 走服务端 cache_edits、forked agent 不设 maxOutputTokens、preservedSegment 锚定边界——都是为了不破坏前缀。
+
+### 经济模型
+
+| 类型 | 相对原价 |
+|---|---|
+| 普通 input token | 1.0x |
+| **cache write** | 1.25x |
+| **cache read** | 0.1x |
+| output token | 5x（与缓存无关） |
+
+第一次走过某前缀多花 25%，后续命中降到 1/10。长会话总开销可降到不开缓存的 10-15%。
+
+Claude Code 这种长 session、工具池庞大、每轮重发整个 history 的应用必须依赖 prompt cache——否则经济上跑不动。
+
+### 监测
+
+`tengu_compact_cache_sharing_success/fallback` 等事件埋点统计命中率。response 里 `cache_creation_input_tokens` / `cache_read_input_tokens` 字段告诉客户端实际写入和读取了多少缓存 token——客户端无法预知，事后看账单。
+
+### TTL
+
+- **默认 5 分钟**（ephemeral）。命中或写入续期。
+- **1 小时 extended**（`cache_control.ttl: "1h"`，beta header）。付更高写入费换更长 TTL。
+- 容量满 LRU 淘汰，可能比 TTL 更早。
+
+`/src/services/api/promptCacheBreakDetection.ts` 的 break detection 根据 response 实际 cache_read 量估测前缀是否过期。
+
+### Claude Code 的实际布局
+
+| 段 | breakpoint | 内容 |
+|---|---|---|
+| System prompt | 1 | Claude Code 主提示词、CLAUDE.md、用户配置 |
+| Tool definitions | 2 | 40+ 工具的 JSON Schema + 描述 |
+| User context | 3 | git status、目录结构、CLAUDE.md hierarchy |
+| Conversation + new input | 不打 | 每次新增 |
+
+**每次新一轮 LLM 调用，前面 95%+ 的 token 走 cache_read（0.1x），只有最新一两条走全价**。所以单轮成本不高。
+
+### 为什么压缩纠结 cache
+
+`autoCompactIfNeeded` 排在最后才触发，因为 compact 是**唯一会大幅破坏前缀缓存**的操作。压缩后整段历史替换成摘要，前缀字节全变，下一轮 cache 全失效，全部 cache_write 重写。这次 API 调用费用可能是前面几十次的总和。
+
+`microCompact` 的 cached-microcompact 路径特别——它通过 API 的 `cache_edits` 让服务端在缓存内部原地删除片段，缓存哈希被特殊处理保持不变。"在不解压缩的情况下编辑压缩文件"。
+
+`forked agent` 跑 compact summary 时复用主线 cache 也是同样动机——主线那段长前缀已在服务端缓存，让 forked agent 用同一个 key（不改 system prompt、不改 tools、不改 thinking config），它的请求蹭主线缓存，整段输入费用 ≈ 0。
+
+### 一句话
+
+**Prompt cache 是 Anthropic API 服务端对 transformer KV cache 做的内容寻址缓存；客户端通过 `cache_control` 标记告诉服务端记住前缀，命中条件是前缀字节完全一致。本地不存任何缓存数据，本地只能控制"打不打标记"和"怎么布局让前缀稳定"——但效果上能把长会话输入成本降到 10%**。这也是为什么 Claude Code 工程里那么多奇怪细节都在为同一件事服务：**让前缀字节尽可能不变**。
+
+---
+
+## 附录：关键文件索引
+
+### 核心循环
+- `/src/QueryEngine.ts` — 顶层 AsyncGenerator
+- `/src/query.ts` — queryLoop 6 阶段
+- `/src/query/deps.ts` — 依赖注入
+- `/src/query/config.ts` — 每轮快照
+
+### 工具系统
+- `/src/Tool.ts` — Tool<Input, Output, P> 接口
+- `/src/tools.ts` — getAllBaseTools / assembleToolPool
+- `/src/services/tools/toolOrchestration.ts` — runTools / partitionToolCalls
+- `/src/services/tools/StreamingToolExecutor.ts` — 边流式接收边执行
+- `/src/services/tools/toolExecution.ts` — runToolUse 执行入口
+
+### 权限
+- `/src/hooks/useCanUseTool.tsx` — React 路由
+- `/src/utils/permissions/permissions.ts` — 7 步 gate
+
+### 压缩
+- `/src/services/compact/autoCompact.ts` — 阈值与熔断
+- `/src/services/compact/compact.ts` — compactConversation 主流程
+- `/src/services/compact/microCompact.ts` — 双路 microcompact
+- `/src/services/compact/sessionMemoryCompact.ts` — 0 LLM 捷径
+- `/src/services/compact/apiMicrocompact.ts` — 服务端 context_edits
+- `/src/services/compact/postCompactCleanup.ts` — 收尾清理
+- `/src/services/compact/prompt.ts` — 摘要 prompt 模板
+- `/src/services/compact/grouping.ts` — API round 分组
+
+### UI
+- `/src/ink/ink.tsx` — fork 重写的 Ink 主类
+- `/src/ink/components/App.tsx` — 应用根组件
+- `/src/ink/hooks/use-input.ts` — 键盘输入 hook
+- `/src/screens/REPL.tsx` — 主交互界面
+
+### 输入与队列
+- `/src/utils/messageQueueManager.ts` — 全局命令队列
+- `/src/utils/processUserInput/processUserInput.ts` — 输入分发
+- `/src/utils/handlePromptSubmit.ts` — Enter 提交
+
+### LSP
+- `/src/tools/LSPTool/LSPTool.ts` — 工具实现
+- `/src/tools/LSPTool/schemas.ts` — operation 联合类型
+- `/src/services/lsp/manager.ts` — server 进程管理
+
+### API
+- `/src/services/api/claude.ts` — queryModelWithStreaming
+- `/src/services/api/promptCacheBreakDetection.ts` — 缓存命中检测
+
+---
+
+*本文档总结了 Claude Code 源码分析的对话过程，按主题重新组织。每一节都以源码片段为依据，结合架构层面的设计观察。*
